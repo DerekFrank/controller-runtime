@@ -85,197 +85,203 @@ var _ = Describe("ConsistentClient", func() {
 		},
 	}}
 
-	for _, repr := range representations {
-		Context(repr.name, func() {
-			var (
-				cl     client.Client
-				ctx    context.Context
-				cancel context.CancelFunc
-			)
+	modes := []struct {
+		name    string
+		options func(o *client.CacheOptions)
+	}{
+		{name: "read your writes", options: func(o *client.CacheOptions) { o.EnableReadYourWritesConsistency = new(true) }},
+		{name: "read after write overlay", options: func(o *client.CacheOptions) { o.EnableReadAfterWriteOverlay = new(true) }},
+	}
 
-			BeforeEach(func(specCtx SpecContext) {
-				// NB: Don't derive from the BeforeEach's context, Ginkgo cancels it when the
-				// node returns and it thus would not outlive it, stopping the cache's watches.
-				ctx, cancel = context.WithCancel(context.WithoutCancel(specCtx))
+	for _, mode := range modes {
+		for _, repr := range representations {
+			Context(mode.name+" "+repr.name, func() {
+				var (
+					cl     client.Client
+					ctx    context.Context
+					cancel context.CancelFunc
+				)
 
-				c, err := cache.New(cfg, cache.Options{Scheme: kscheme.Scheme})
-				Expect(err).NotTo(HaveOccurred())
+				BeforeEach(func(specCtx SpecContext) {
+					// NB: Don't derive from the BeforeEach's context, Ginkgo cancels it when the
+					// node returns and it thus would not outlive it, stopping the cache's watches.
+					ctx, cancel = context.WithCancel(context.WithoutCancel(specCtx))
 
-				// Set up informers for types used through the consistent client.
-				_, err = c.GetInformer(ctx, repr.newObject())
-				Expect(err).NotTo(HaveOccurred())
-				_, err = c.GetInformer(ctx, &corev1.Namespace{})
-				Expect(err).NotTo(HaveOccurred())
-
-				go func() {
-					defer GinkgoRecover()
-					Expect(c.Start(ctx)).To(Succeed())
-				}()
-				Expect(c.WaitForCacheSync(ctx)).To(BeTrue())
-
-				cl, err = client.New(cfg, client.Options{
-					Scheme: kscheme.Scheme,
-					Cache: &client.CacheOptions{
-						Reader:                          c,
-						EnableReadYourWritesConsistency: new(true),
-					},
-				})
-				Expect(err).NotTo(HaveOccurred())
-			})
-
-			AfterEach(func() {
-				cancel()
-			})
-
-			newConfigMap := func(ns string) client.Object {
-				cm := repr.newObject()
-				cm.SetNamespace(ns)
-				cm.SetName(fmt.Sprintf("consistency-test-%d", counter.Add(1)))
-				cm.SetAnnotations(map[string]string{"key": "value"})
-				return cm
-			}
-
-			DescribeTable("write then read",
-				func(ctx context.Context, write func(ctx context.Context, cl client.Client, cm client.Object) (writeResult, error)) {
-					ns := &corev1.Namespace{Name: fmt.Sprintf("consistency-wtr-%d", counter.Add(1))}
-					Expect(cl.Create(ctx, ns)).To(Succeed())
-					DeferCleanup(func(ctx context.Context) {
-						Expect(client.IgnoreNotFound(cl.Delete(ctx, ns))).To(Succeed())
-					})
-
-					cm := newConfigMap(ns.Name)
-					Expect(cl.Create(ctx, cm)).To(Succeed())
-					DeferCleanup(func(ctx context.Context) {
-						Expect(client.IgnoreNotFound(cl.Delete(ctx, cm))).To(Succeed())
-					})
-
-					result, err := write(ctx, cl, cm)
+					c, err := cache.New(cfg, cache.Options{Scheme: kscheme.Scheme})
 					Expect(err).NotTo(HaveOccurred())
 
-					done := make(chan struct{})
+					// Set up informers for types used through the consistent client.
+					_, err = c.GetInformer(ctx, repr.newObject())
+					Expect(err).NotTo(HaveOccurred())
+					_, err = c.GetInformer(ctx, &corev1.Namespace{})
+					Expect(err).NotTo(HaveOccurred())
 
 					go func() {
 						defer GinkgoRecover()
-						defer func() { done <- struct{}{} }()
-
-						if result.deleted {
-							err := cl.Get(ctx, client.ObjectKeyFromObject(cm), repr.newObject())
-							Expect(apierrors.IsNotFound(err)).To(BeTrue(), "expected NotFound after delete, got: %v", err)
-						} else {
-							got := repr.newObject()
-							Expect(cl.Get(ctx, client.ObjectKeyFromObject(cm), got)).To(Succeed())
-							Expect(got.GetName()).To(Equal(result.name))
-							Expect(got.GetResourceVersion()).To(Equal(result.resourceVersion))
-						}
+						Expect(c.Start(ctx)).To(Succeed())
 					}()
+					Expect(c.WaitForCacheSync(ctx)).To(BeTrue())
 
-					go func() {
-						defer GinkgoRecover()
-						defer func() { done <- struct{}{} }()
+					cacheOptions := &client.CacheOptions{Reader: c}
+					mode.options(cacheOptions)
+					cl, err = client.New(cfg, client.Options{Scheme: kscheme.Scheme, Cache: cacheOptions})
+					Expect(err).NotTo(HaveOccurred())
+				})
 
-						list := repr.newList()
-						Expect(cl.List(ctx, list, client.InNamespace(ns.Name))).To(Succeed())
-						items, err := apimeta.ExtractList(list)
+				AfterEach(func() {
+					cancel()
+				})
+
+				newConfigMap := func(ns string) client.Object {
+					cm := repr.newObject()
+					cm.SetNamespace(ns)
+					cm.SetName(fmt.Sprintf("consistency-test-%d", counter.Add(1)))
+					cm.SetAnnotations(map[string]string{"key": "value"})
+					return cm
+				}
+
+				DescribeTable("write then read",
+					func(ctx context.Context, write func(ctx context.Context, cl client.Client, cm client.Object) (writeResult, error)) {
+						ns := &corev1.Namespace{Name: fmt.Sprintf("consistency-wtr-%d", counter.Add(1))}
+						Expect(cl.Create(ctx, ns)).To(Succeed())
+						DeferCleanup(func(ctx context.Context) {
+							Expect(client.IgnoreNotFound(cl.Delete(ctx, ns))).To(Succeed())
+						})
+
+						cm := newConfigMap(ns.Name)
+						Expect(cl.Create(ctx, cm)).To(Succeed())
+						DeferCleanup(func(ctx context.Context) {
+							Expect(client.IgnoreNotFound(cl.Delete(ctx, cm))).To(Succeed())
+						})
+
+						result, err := write(ctx, cl, cm)
 						Expect(err).NotTo(HaveOccurred())
 
-						if result.deleted {
-							Expect(items).To(BeEmpty(), "list should be empty after delete")
-						} else {
-							Expect(items).To(HaveLen(1), "list should contain exactly one ConfigMap")
-							item := items[0].(client.Object)
-							Expect(item.GetName()).To(Equal(result.name))
-							Expect(item.GetResourceVersion()).To(Equal(result.resourceVersion))
-						}
-					}()
+						done := make(chan struct{})
 
-					<-done
-					<-done
-				},
+						go func() {
+							defer GinkgoRecover()
+							defer func() { done <- struct{}{} }()
 
-				Entry("create", func(ctx context.Context, cl client.Client, cm client.Object) (writeResult, error) {
-					return writeResult{
-						name:            cm.GetName(),
-						resourceVersion: cm.GetResourceVersion(),
-					}, nil // already created in the setup
-				}),
+							if result.deleted {
+								err := cl.Get(ctx, client.ObjectKeyFromObject(cm), repr.newObject())
+								Expect(apierrors.IsNotFound(err)).To(BeTrue(), "expected NotFound after delete, got: %v", err)
+							} else {
+								got := repr.newObject()
+								Expect(cl.Get(ctx, client.ObjectKeyFromObject(cm), got)).To(Succeed())
+								Expect(got.GetName()).To(Equal(result.name))
+								Expect(got.GetResourceVersion()).To(Equal(result.resourceVersion))
+							}
+						}()
 
-				Entry("update", func(ctx context.Context, cl client.Client, cm client.Object) (writeResult, error) {
-					got := repr.newObject()
-					if err := cl.Get(ctx, client.ObjectKeyFromObject(cm), got); err != nil {
-						return writeResult{}, err
-					}
-					got.SetAnnotations(map[string]string{"key": "updated"})
-					if err := cl.Update(ctx, got); err != nil {
-						return writeResult{}, err
-					}
-					return writeResult{
-						name:            cm.GetName(),
-						resourceVersion: got.GetResourceVersion(),
-					}, nil
-				}),
+						go func() {
+							defer GinkgoRecover()
+							defer func() { done <- struct{}{} }()
 
-				Entry("patch", func(ctx context.Context, cl client.Client, cm client.Object) (writeResult, error) {
-					got := repr.newObject()
-					if err := cl.Get(ctx, client.ObjectKeyFromObject(cm), got); err != nil {
-						return writeResult{}, err
-					}
-					patch := client.MergeFrom(got.DeepCopyObject().(client.Object))
-					got.SetAnnotations(map[string]string{"key": "value", "patched": "yes"})
-					if err := cl.Patch(ctx, got, patch); err != nil {
-						return writeResult{}, err
-					}
-					return writeResult{
-						name:            cm.GetName(),
-						resourceVersion: got.GetResourceVersion(),
-					}, nil
-				}),
+							list := repr.newList()
+							Expect(cl.List(ctx, list, client.InNamespace(ns.Name))).To(Succeed())
+							items, err := apimeta.ExtractList(list)
+							Expect(err).NotTo(HaveOccurred())
 
-				Entry("apply", func(ctx context.Context, cl client.Client, cm client.Object) (writeResult, error) {
-					ac, resourceVersion := repr.applyConfig(cm.GetNamespace(), cm.GetName(), map[string]string{"key": "applied"})
-					if err := cl.Apply(ctx, ac, client.FieldOwner("consistency-test"), client.ForceOwnership); err != nil {
-						return writeResult{}, err
-					}
-					return writeResult{
-						name:            cm.GetName(),
-						resourceVersion: resourceVersion(),
-					}, nil
-				}),
+							if result.deleted {
+								Expect(items).To(BeEmpty(), "list should be empty after delete")
+							} else {
+								Expect(items).To(HaveLen(1), "list should contain exactly one ConfigMap")
+								item := items[0].(client.Object)
+								Expect(item.GetName()).To(Equal(result.name))
+								Expect(item.GetResourceVersion()).To(Equal(result.resourceVersion))
+							}
+						}()
 
-				Entry("delete", func(ctx context.Context, cl client.Client, cm client.Object) (writeResult, error) {
-					if err := cl.Delete(ctx, cm); err != nil {
-						return writeResult{}, err
-					}
-					return writeResult{
-						name:    cm.GetName(),
-						deleted: true,
-					}, nil
-				}),
-			)
+						<-done
+						<-done
+					},
 
-			Describe("Delete object with finalizer then Get", func() {
-				It("should observe the updated object with deletion timestamp after delete", func() {
-					cm := newConfigMap("default")
-					cm.SetFinalizers([]string{"test.io/hold"})
-					Expect(cl.Create(ctx, cm)).To(Succeed())
-					DeferCleanup(func(ctx context.Context) {
+					Entry("create", func(ctx context.Context, cl client.Client, cm client.Object) (writeResult, error) {
+						return writeResult{
+							name:            cm.GetName(),
+							resourceVersion: cm.GetResourceVersion(),
+						}, nil // already created in the setup
+					}),
+
+					Entry("update", func(ctx context.Context, cl client.Client, cm client.Object) (writeResult, error) {
 						got := repr.newObject()
-						if err := cl.Get(ctx, client.ObjectKeyFromObject(cm), got); err == nil {
-							got.SetFinalizers(nil)
-							Expect(cl.Update(ctx, got)).To(Succeed())
+						if err := cl.Get(ctx, client.ObjectKeyFromObject(cm), got); err != nil {
+							return writeResult{}, err
 						}
+						got.SetAnnotations(map[string]string{"key": "updated"})
+						if err := cl.Update(ctx, got); err != nil {
+							return writeResult{}, err
+						}
+						return writeResult{
+							name:            cm.GetName(),
+							resourceVersion: got.GetResourceVersion(),
+						}, nil
+					}),
+
+					Entry("patch", func(ctx context.Context, cl client.Client, cm client.Object) (writeResult, error) {
+						got := repr.newObject()
+						if err := cl.Get(ctx, client.ObjectKeyFromObject(cm), got); err != nil {
+							return writeResult{}, err
+						}
+						patch := client.MergeFrom(got.DeepCopyObject().(client.Object))
+						got.SetAnnotations(map[string]string{"key": "value", "patched": "yes"})
+						if err := cl.Patch(ctx, got, patch); err != nil {
+							return writeResult{}, err
+						}
+						return writeResult{
+							name:            cm.GetName(),
+							resourceVersion: got.GetResourceVersion(),
+						}, nil
+					}),
+
+					Entry("apply", func(ctx context.Context, cl client.Client, cm client.Object) (writeResult, error) {
+						ac, resourceVersion := repr.applyConfig(cm.GetNamespace(), cm.GetName(), map[string]string{"key": "applied"})
+						if err := cl.Apply(ctx, ac, client.FieldOwner("consistency-test"), client.ForceOwnership); err != nil {
+							return writeResult{}, err
+						}
+						return writeResult{
+							name:            cm.GetName(),
+							resourceVersion: resourceVersion(),
+						}, nil
+					}),
+
+					Entry("delete", func(ctx context.Context, cl client.Client, cm client.Object) (writeResult, error) {
+						if err := cl.Delete(ctx, cm); err != nil {
+							return writeResult{}, err
+						}
+						return writeResult{
+							name:    cm.GetName(),
+							deleted: true,
+						}, nil
+					}),
+				)
+
+				Describe("Delete object with finalizer then Get", func() {
+					It("should observe the updated object with deletion timestamp after delete", func() {
+						cm := newConfigMap("default")
+						cm.SetFinalizers([]string{"test.io/hold"})
+						Expect(cl.Create(ctx, cm)).To(Succeed())
+						DeferCleanup(func(ctx context.Context) {
+							got := repr.newObject()
+							if err := cl.Get(ctx, client.ObjectKeyFromObject(cm), got); err == nil {
+								got.SetFinalizers(nil)
+								Expect(cl.Update(ctx, got)).To(Succeed())
+							}
+						})
+
+						got := repr.newObject()
+						Expect(cl.Get(ctx, client.ObjectKeyFromObject(cm), got)).To(Succeed())
+
+						Expect(cl.Delete(ctx, cm)).To(Succeed())
+
+						afterDelete := repr.newObject()
+						Expect(cl.Get(ctx, client.ObjectKeyFromObject(cm), afterDelete)).To(Succeed())
+						Expect(afterDelete.GetDeletionTimestamp()).NotTo(BeNil(), "should have a deletion timestamp")
 					})
-
-					got := repr.newObject()
-					Expect(cl.Get(ctx, client.ObjectKeyFromObject(cm), got)).To(Succeed())
-
-					Expect(cl.Delete(ctx, cm)).To(Succeed())
-
-					afterDelete := repr.newObject()
-					Expect(cl.Get(ctx, client.ObjectKeyFromObject(cm), afterDelete)).To(Succeed())
-					Expect(afterDelete.GetDeletionTimestamp()).NotTo(BeNil(), "should have a deletion timestamp")
 				})
 			})
-		})
+		}
 	}
 
 	Describe("SubResource Create", func() {

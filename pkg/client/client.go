@@ -33,6 +33,7 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/metadata"
 	"k8s.io/client-go/rest"
+	toolscache "k8s.io/client-go/tools/cache"
 	"k8s.io/utils/ptr"
 
 	"sigs.k8s.io/controller-runtime/pkg/cache/cacheapi"
@@ -113,6 +114,33 @@ type CacheOptions struct {
 	//
 	// Defaults to false.
 	EnableReadYourWritesConsistency *bool
+
+	// EnableReadAfterWriteOverlay makes reads from the cache include the objects returned by writes performed through
+	// the same client, until the cache observes them. Instead of waiting for the cache to catch up like
+	// EnableReadYourWritesConsistency does, each write's response is held in an overlay. A Get or List returns the
+	// overlay's copy of an object when its resourceVersion is newer than the cache's, so reads never block. Deleting an
+	// object hides it from reads until the cache observes the delete. Entries are evicted by an event handler on the
+	// informer once it observes the same or a newer resourceVersion. The informer's store and other event handlers
+	// never see the overlay.
+	//
+	// resourceVersions are compared with k8s.io/apimachinery/pkg/util/resourceversion (KEP-5504). When two can't be
+	// compared, the cache's copy is served.
+	//
+	// The `DisableReadYourWritesConsistency` option disables this for individual requests.
+	//
+	// Objects the cache doesn't hold yet are only added to Lists without a field selector. DeleteAllOf isn't
+	// overlaid.
+	//
+	// This is an experimental feature. It can't be combined with EnableReadYourWritesConsistency.
+	//
+	// Defaults to false.
+	EnableReadAfterWriteOverlay *bool
+
+	// ReadAfterWriteOverlayTransform is applied to write responses before the overlay serves them. Set it to the
+	// transform the cache applies to the same objects, such as cache.TransformStripManagedFields, so that objects
+	// served from the overlay carry the same fields as objects served from the cache. A transform must not strip
+	// the resourceVersion or the UID.
+	ReadAfterWriteOverlayTransform toolscache.TransformFunc
 }
 
 // NewClientFunc allows a user to define how to create a client.
@@ -260,13 +288,21 @@ func newClient(config *rest.Config, options Options) (*client, Client, error) {
 		c.uncachedGVKs[gvk] = struct{}{}
 	}
 
-	if !ptr.Deref(options.Cache.EnableReadYourWritesConsistency, false) {
+	readYourWrites := ptr.Deref(options.Cache.EnableReadYourWritesConsistency, false)
+	overlay := ptr.Deref(options.Cache.EnableReadAfterWriteOverlay, false)
+	if readYourWrites && overlay {
+		return nil, nil, errors.New("EnableReadYourWritesConsistency and EnableReadAfterWriteOverlay can't both be set")
+	}
+	if !readYourWrites && !overlay {
 		return c, c, nil
 	}
 
 	informerCache, isCache := options.Cache.Reader.(cacheapi.Informers)
 	if !isCache {
 		return nil, nil, fmt.Errorf("cache reader does not implement %T, can not provide ReadYourWritesConsistency", cacheapi.Informers(nil))
+	}
+	if overlay {
+		return c, newOverlayClient(c, informerCache, options.Cache.ReadAfterWriteOverlayTransform), nil
 	}
 
 	return c, newConsistentClient(

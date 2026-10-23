@@ -55,3 +55,8 @@ func NewConsistentClient(
 ) Client {
 	return newConsistentClient(upstreamClientShim{upstream}, informers, newWriteBarrier, logr.Discard())
 }
+
+// NewOverlayClient constructs an overlay client on top of an arbitrary upstream.
+func NewOverlayClient(upstream UpstreamClient, informers cacheapi.Informers) Client {
+	return newOverlayClient(upstreamClientShim{upstream}, informers, nil)
+}

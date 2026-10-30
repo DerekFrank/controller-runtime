@@ -70,7 +70,14 @@ type Writer interface {
 	// struct pointer so that obj can be updated with the content returned by the Server.
 	Create(ctx context.Context, obj Object, opts ...CreateOption) error
 
-	// Delete deletes the given obj from Kubernetes cluster.
+	// Delete deletes the given obj from Kubernetes cluster. obj must be a
+	// struct pointer so that obj can be updated with the content returned by the Server
+	// if the object remains in storage, i.e. it is held by finalizers or within its
+	// deletion grace period. obj is left unchanged if the object was removed from
+	// storage or the request failed. Callers can check the deletionTimestamp of obj,
+	// or whether its resourceVersion changed, to tell the two apart. A dry-run request
+	// updates obj with the object as it would remain, if a real request would leave it
+	// in storage, but keeps its resourceVersion.
 	Delete(ctx context.Context, obj Object, opts ...DeleteOption) error
 
 	// Update updates the given obj in the Kubernetes cluster. obj must be a

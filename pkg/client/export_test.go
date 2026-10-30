@@ -21,6 +21,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache/cacheapi"
 	"sigs.k8s.io/controller-runtime/pkg/client/internal/writebarrier"
 )
@@ -43,7 +44,7 @@ type upstreamClientShim struct {
 	UpstreamClient
 }
 
-func (u upstreamClientShim) delete(ctx context.Context, obj Object, opts ...DeleteOption) (*unstructured.Unstructured, error) {
+func (u upstreamClientShim) delete(ctx context.Context, obj Object, opts ...DeleteOption) (runtime.Object, error) {
 	return u.DeleteWithResult(ctx, obj, opts...)
 }
 

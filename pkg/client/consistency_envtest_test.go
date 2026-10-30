@@ -275,6 +275,37 @@ var _ = Describe("ConsistentClient", func() {
 					Expect(cl.Get(ctx, client.ObjectKeyFromObject(cm), afterDelete)).To(Succeed())
 					Expect(afterDelete.GetDeletionTimestamp()).NotTo(BeNil(), "should have a deletion timestamp")
 				})
+
+				It("should update obj with the terminating object", func() {
+					cm := newConfigMap("default")
+					cm.SetFinalizers([]string{"test.io/hold"})
+					Expect(cl.Create(ctx, cm)).To(Succeed())
+					DeferCleanup(func(ctx context.Context) {
+						got := repr.newObject()
+						if err := cl.Get(ctx, client.ObjectKeyFromObject(cm), got); err == nil {
+							got.SetFinalizers(nil)
+							Expect(cl.Update(ctx, got)).To(Succeed())
+						}
+					})
+					rvBefore := cm.GetResourceVersion()
+
+					Expect(cl.Delete(ctx, cm)).To(Succeed())
+					Expect(cm.GetDeletionTimestamp()).NotTo(BeNil())
+					Expect(cm.GetResourceVersion()).NotTo(Equal(rvBefore))
+
+					afterDelete := repr.newObject()
+					Expect(cl.Get(ctx, client.ObjectKeyFromObject(cm), afterDelete)).To(Succeed())
+					Expect(cm.GetResourceVersion()).To(Equal(afterDelete.GetResourceVersion()))
+				})
+			})
+
+			It("should leave obj unchanged if the object was removed from storage", func() {
+				cm := newConfigMap("default")
+				Expect(cl.Create(ctx, cm)).To(Succeed())
+				before := cm.DeepCopyObject()
+
+				Expect(cl.Delete(ctx, cm)).To(Succeed())
+				Expect(cm).To(Equal(before))
 			})
 		})
 	}

@@ -65,7 +65,7 @@ func init() {
 type consistentClientUpstream interface {
 	Client
 
-	delete(ctx context.Context, obj Object, opts ...DeleteOption) (*unstructured.Unstructured, error)
+	delete(ctx context.Context, obj Object, opts ...DeleteOption) (runtime.Object, error)
 }
 
 var _ Client = (*consistentClient)(nil)
@@ -440,7 +440,7 @@ func (c *consistentClient) Delete(ctx context.Context, obj Object, opts ...Delet
 	// Prefer waiting for the RV rather than an actual event since that is likely to be more resilient.
 	// This can only work if the response contains the RV which in turn only happens if the request did
 	// not delete the object from storage, for example because it had a finalizer.
-	if rvRaw := response.GetResourceVersion(); rvRaw != "" {
+	if rvRaw := resourceVersionOfDeleteResponse(response); rvRaw != "" {
 		rv, err := strconv.ParseInt(rvRaw, 10, 64)
 		if err != nil {
 			return fmt.Errorf("failed to parse resource version %s: %w", rvRaw, err)
@@ -449,7 +449,19 @@ func (c *consistentClient) Delete(ctx context.Context, obj Object, opts ...Delet
 		h.SetMinimumRV(namespacedName, rv)
 	}
 
-	return nil
+	return decodeDeleteResponseInto(obj, response)
+}
+
+// resourceVersionOfDeleteResponse returns the resourceVersion of the response to
+// a delete request, which is either the object or a Status.
+func resourceVersionOfDeleteResponse(response runtime.Object) string {
+	if accessor, err := meta.Accessor(response); err == nil {
+		return accessor.GetResourceVersion()
+	}
+	if accessor, err := meta.ListAccessor(response); err == nil {
+		return accessor.GetResourceVersion()
+	}
+	return ""
 }
 
 func (c *consistentClient) uidForDelete(ctx context.Context, gvk schema.GroupVersionKind, key ObjectKey, obj Object, opts ...DeleteOption) (types.UID, error) {

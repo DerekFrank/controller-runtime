@@ -18,12 +18,15 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"reflect"
 	"strings"
 
 	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -374,21 +377,107 @@ func (c *client) Update(ctx context.Context, obj Object, opts ...UpdateOption) e
 
 // Delete implements client.Client.
 func (c *client) Delete(ctx context.Context, obj Object, opts ...DeleteOption) error {
-	_, err := c.delete(ctx, obj, opts...)
-	return err
+	response, err := c.delete(ctx, obj, opts...)
+	if err != nil {
+		return err
+	}
+	return decodeDeleteResponseInto(obj, response)
 }
 
 // delete issues a delete call and returns the response or an error. The response
-// gets deserialized into an unstructured and is either a metav1.Status if the object
-// is gone from storage or the object if it remains, for example because of finalizers.
-func (c *client) delete(ctx context.Context, obj Object, opts ...DeleteOption) (*unstructured.Unstructured, error) {
+// is either a metav1.Status if the object is gone from storage or the object, which
+// remains in storage for example because of finalizers, but is also returned by
+// some resources such as pods after they were removed. It is decoded into the type
+// of obj if obj is typed, and into an unstructured otherwise.
+func (c *client) delete(ctx context.Context, obj Object, opts ...DeleteOption) (runtime.Object, error) {
 	switch obj.(type) {
 	case runtime.Unstructured:
 		return c.unstructuredClient.Delete(ctx, obj, opts...)
-	// The typed client can also delete PartialObjectMeta
+	case *metav1.PartialObjectMetadata:
+		// The typed client can only decode the response for kinds in the scheme,
+		// so delete metadata-only objects through the unstructured client.
+		u := &unstructured.Unstructured{}
+		u.SetGroupVersionKind(obj.GetObjectKind().GroupVersionKind())
+		u.SetNamespace(obj.GetNamespace())
+		u.SetName(obj.GetName())
+		return c.unstructuredClient.Delete(ctx, u, opts...)
 	default:
 		return c.typedClient.Delete(ctx, obj, opts...)
 	}
+}
+
+// decodeDeleteResponseInto updates obj with the response to a delete request for
+// it, as returned by client.delete, if the object remains in storage. Otherwise,
+// obj is left unchanged. Like Create, Update and Patch, it preserves the GVK of obj.
+func decodeDeleteResponseInto(obj Object, response runtime.Object) error {
+	if !remainsAfterDelete(response) {
+		return nil
+	}
+	gvk := obj.GetObjectKind().GroupVersionKind()
+	defer obj.GetObjectKind().SetGroupVersionKind(gvk)
+
+	u, isUnstructured := response.(*unstructured.Unstructured)
+	if !isUnstructured {
+		// The typed client decoded the response into the type of obj.
+		if reflect.TypeOf(response) != reflect.TypeOf(obj) {
+			return fmt.Errorf("delete succeeded, but the response has type %T rather than %T", response, obj)
+		}
+		reflect.ValueOf(obj).Elem().Set(reflect.ValueOf(response).Elem())
+		return nil
+	}
+	if objU, isUnstructured := obj.(runtime.Unstructured); isUnstructured {
+		objU.SetUnstructuredContent(u.Object)
+		return nil
+	}
+
+	// Decode metadata-only objects from JSON, like the API server's response
+	// would be, into a new object first so that obj is left unchanged on error.
+	data, err := u.MarshalJSON()
+	if err != nil {
+		return fmt.Errorf("delete succeeded, but failed to encode the response: %w", err)
+	}
+	remaining := reflect.New(reflect.TypeOf(obj).Elem())
+	if err := json.Unmarshal(data, remaining.Interface()); err != nil {
+		return fmt.Errorf("delete succeeded, but failed to decode the response into %T: %w", obj, err)
+	}
+	reflect.ValueOf(obj).Elem().Set(remaining.Elem())
+	return nil
+}
+
+// remainsAfterDelete returns whether the response to a delete request is an object
+// that remains in storage. The API server responds with a Status if it removed the
+// object, except for resources that return the deleted object instead, such as
+// pods. It keeps an object only if the object is held by finalizers or within its
+// deletion grace period, so apply the same rule. Namespaces additionally remain
+// until the namespace controller has removed their spec finalizers.
+func remainsAfterDelete(response runtime.Object) bool {
+	if isStatus(response) {
+		return false
+	}
+	accessor, err := meta.Accessor(response)
+	if err != nil {
+		return false
+	}
+	if gracePeriod := accessor.GetDeletionGracePeriodSeconds(); len(accessor.GetFinalizers()) > 0 || (gracePeriod != nil && *gracePeriod > 0) {
+		return true
+	}
+	switch response := response.(type) {
+	case *corev1.Namespace:
+		return len(response.Spec.Finalizers) > 0
+	case *unstructured.Unstructured:
+		if response.GroupVersionKind().GroupKind() == (schema.GroupKind{Kind: "Namespace"}) {
+			specFinalizers, _, _ := unstructured.NestedStringSlice(response.Object, "spec", "finalizers")
+			return len(specFinalizers) > 0
+		}
+	}
+	return false
+}
+
+func isStatus(response runtime.Object) bool {
+	if _, isStatus := response.(*metav1.Status); isStatus {
+		return true
+	}
+	return response.GetObjectKind().GroupVersionKind() == metav1.Unversioned.WithKind("Status")
 }
 
 // DeleteAllOf implements client.Client.

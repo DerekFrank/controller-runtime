@@ -19,6 +19,7 @@ package client_test
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"strconv"
 	"sync"
 	"testing"
@@ -553,24 +554,23 @@ type fakeConsistentClientUpstream struct {
 }
 
 func (u *fakeConsistentClientUpstream) DeleteWithResult(ctx context.Context, obj client.Object, opts ...client.DeleteOption) (*unstructured.Unstructured, error) {
+	before := obj.DeepCopyObject()
 	if err := u.Delete(ctx, obj, opts...); err != nil {
 		return nil, err
 	}
 
-	gvk, err := u.GroupVersionKindFor(obj)
+	// Delete leaves obj unchanged if the object was removed from storage, in
+	// which case the API server responds with a Status.
+	if reflect.DeepEqual(obj, before) {
+		status := &unstructured.Unstructured{}
+		status.SetGroupVersionKind(metav1.Unversioned.WithKind("Status"))
+		return status, nil
+	}
+	content, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
 	if err != nil {
 		return nil, err
 	}
-	result := &unstructured.Unstructured{}
-	result.SetGroupVersionKind(gvk)
-	if err := u.Get(ctx, client.ObjectKeyFromObject(obj), result); err != nil {
-		if apierrors.IsNotFound(err) {
-			return &unstructured.Unstructured{}, nil
-		}
-		return nil, err
-	}
-
-	return result, nil
+	return &unstructured.Unstructured{Object: content}, nil
 }
 
 // fakeCache delivers events to eventhandlers from a client using interceptorFuncs

@@ -413,6 +413,12 @@ func (c *fakeClient) Get(ctx context.Context, key client.ObjectKey, obj client.O
 		return err
 	}
 
+	return c.copyInto(o, gvk, obj)
+}
+
+// copyInto copies o, as returned by the tracker, into obj the same way the
+// API server's response would be decoded into it.
+func (c *fakeClient) copyInto(o runtime.Object, gvk schema.GroupVersionKind, obj client.Object) error {
 	ta, err := meta.TypeAccessor(o)
 	if err != nil {
 		return err
@@ -713,7 +719,27 @@ func (c *fakeClient) Delete(ctx context.Context, obj client.Object, opts ...clie
 	delOptions.ApplyOptions(opts)
 
 	if slices.Contains(delOptions.DryRun, metav1.DryRunAll) {
-		return nil
+		// Like the API server, update obj with the object as it would remain,
+		// without persisting the deletion.
+		existing, err := c.tracker.Get(gvr, accessor.GetNamespace(), accessor.GetName())
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		existingAccessor, err := meta.Accessor(existing)
+		if err != nil {
+			return err
+		}
+		if len(existingAccessor.GetFinalizers()) == 0 {
+			return nil
+		}
+		if existingAccessor.GetDeletionTimestamp() == nil {
+			now := metav1.Now()
+			existingAccessor.SetDeletionTimestamp(&now)
+		}
+		return c.decodeRemainingInto(existing, obj)
 	}
 
 	c.trackerWriteLock.Lock()
@@ -740,7 +766,31 @@ func (c *fakeClient) Delete(ctx context.Context, obj client.Object, opts ...clie
 		}
 	}
 
-	return c.deleteObjectLocked(gvr, accessor)
+	remaining, err := c.deleteObjectLocked(gvr, accessor)
+	if err != nil || remaining == nil {
+		return err
+	}
+	return c.decodeRemainingInto(remaining, obj)
+}
+
+// decodeRemainingInto updates obj with remaining, the object that remains in
+// storage after a delete request, the same way the API server's response
+// would be decoded into it. obj is left unchanged on error.
+func (c *fakeClient) decodeRemainingInto(remaining runtime.Object, obj client.Object) error {
+	gvk, err := apiutil.GVKForObject(obj, c.scheme)
+	if err != nil {
+		return err
+	}
+	into := reflect.New(reflect.TypeOf(obj).Elem())
+	intoObj, ok := reflect.TypeAssert[client.Object](into)
+	if !ok {
+		return fmt.Errorf("%T does not implement client.Object", into.Interface())
+	}
+	if err := c.copyInto(remaining, gvk, intoObj); err != nil {
+		return err
+	}
+	reflect.ValueOf(obj).Elem().Set(into.Elem())
+	return nil
 }
 
 func (c *fakeClient) DeleteAllOf(ctx context.Context, obj client.Object, opts ...client.DeleteAllOfOption) error {
@@ -785,8 +835,7 @@ func (c *fakeClient) DeleteAllOf(ctx context.Context, obj client.Object, opts ..
 		if err != nil {
 			return err
 		}
-		err = c.deleteObjectLocked(gvr, accessor)
-		if err != nil {
+		if _, err := c.deleteObjectLocked(gvr, accessor); err != nil {
 			return err
 		}
 	}
@@ -1221,7 +1270,9 @@ func (c *fakeClient) SubResource(subResource string) client.SubResourceClient {
 	return &fakeSubResourceClient{client: c, subResource: subResource}
 }
 
-func (c *fakeClient) deleteObjectLocked(gvr schema.GroupVersionResource, accessor metav1.Object) error {
+// deleteObjectLocked deletes the object identified by gvr and accessor. If the
+// object is held by finalizers, it is marked for deletion and returned instead.
+func (c *fakeClient) deleteObjectLocked(gvr schema.GroupVersionResource, accessor metav1.Object) (runtime.Object, error) {
 	old, err := c.tracker.Get(gvr, accessor.GetNamespace(), accessor.GetName())
 	if err == nil {
 		oldAccessor, err := meta.Accessor(old)
@@ -1231,13 +1282,16 @@ func (c *fakeClient) deleteObjectLocked(gvr schema.GroupVersionResource, accesso
 				oldAccessor.SetDeletionTimestamp(&now)
 				// Call update directly with mutability parameter set to true to allow
 				// changes to deletionTimestamp
-				return c.tracker.update(gvr, old, accessor.GetNamespace(), false, true, metav1.UpdateOptions{})
+				if err := c.tracker.update(gvr, old, accessor.GetNamespace(), false, true, metav1.UpdateOptions{}); err != nil {
+					return nil, err
+				}
+				return c.tracker.Get(gvr, accessor.GetNamespace(), accessor.GetName())
 			}
 		}
 	}
 
 	// TODO: implement propagation
-	return c.tracker.Delete(gvr, accessor.GetNamespace(), accessor.GetName())
+	return nil, c.tracker.Delete(gvr, accessor.GetNamespace(), accessor.GetName())
 }
 
 func getGVRFromObject(obj runtime.Object, scheme *runtime.Scheme) (schema.GroupVersionResource, error) {
@@ -1287,11 +1341,13 @@ func (sw *fakeSubResourceClient) Create(ctx context.Context, obj client.Object, 
 		if !isEviction {
 			return apierrors.NewBadRequest(fmt.Sprintf("got invalid type %T, expected Eviction", subResource))
 		}
-		if _, isPod := obj.(*corev1.Pod); !isPod {
+		pod, isPod := obj.(*corev1.Pod)
+		if !isPod {
 			return apierrors.NewNotFound(schema.GroupResource{}, "")
 		}
 
-		return sw.client.Delete(ctx, obj)
+		// The API server responds to an eviction with a Status, so leave obj unchanged.
+		return sw.client.Delete(ctx, pod.DeepCopy())
 	case "token":
 		tokenRequest, isTokenRequest := subResource.(*authenticationv1.TokenRequest)
 		if !isTokenRequest {

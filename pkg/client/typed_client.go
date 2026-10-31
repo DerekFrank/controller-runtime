@@ -82,13 +82,17 @@ func (c *typedClient) Delete(ctx context.Context, obj Object, opts ...DeleteOpti
 	deleteOpts := DeleteOptions{}
 	deleteOpts.ApplyOptions(opts)
 
-	return o.Delete().
+	result := o.Delete().
 		NamespaceIfScoped(o.namespace, o.isNamespaced()).
 		Resource(o.resource()).
 		Name(o.name).
 		Body(deleteOpts.AsDeleteOptions()).
-		Do(ctx).
-		Error()
+		Do(ctx)
+	response, err := result.Get()
+	if err != nil || !remainsAfterDelete(response) {
+		return err
+	}
+	return result.Into(obj)
 }
 
 // DeleteAllOf implements client.Client.

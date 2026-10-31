@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"strings"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -320,18 +321,46 @@ func (c *client) Update(ctx context.Context, obj Object, opts ...UpdateOption) e
 
 // Delete implements client.Client.
 func (c *client) Delete(ctx context.Context, obj Object, opts ...DeleteOption) error {
-	switch obj.(type) {
+	defer c.resetGroupVersionKind(obj, obj.GetObjectKind().GroupVersionKind())
+	switch o := obj.(type) {
 	case runtime.Unstructured:
 		return c.unstructuredClient.Delete(ctx, obj, opts...)
 	case *metav1.PartialObjectMetadata:
 		u := &unstructured.Unstructured{}
-		u.SetGroupVersionKind(obj.GetObjectKind().GroupVersionKind())
+		u.SetGroupVersionKind(o.GroupVersionKind())
 		u.SetNamespace(obj.GetNamespace())
 		u.SetName(obj.GetName())
-		return c.unstructuredClient.Delete(ctx, u, opts...)
+		if err := c.unstructuredClient.Delete(ctx, u, opts...); err != nil || !remainsAfterDelete(u) {
+			return err
+		}
+		metadata := &metav1.PartialObjectMetadata{}
+		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(u.Object, metadata); err != nil {
+			return fmt.Errorf("delete succeeded, but failed to convert the response into %T: %w", obj, err)
+		}
+		*o = *metadata
+		return nil
 	default:
 		return c.typedClient.Delete(ctx, obj, opts...)
 	}
+}
+
+func remainsAfterDelete(response runtime.Object) bool {
+	if accessor, err := meta.Accessor(response); err == nil {
+		gracePeriod := accessor.GetDeletionGracePeriodSeconds()
+		if len(accessor.GetFinalizers()) > 0 || (gracePeriod != nil && *gracePeriod > 0) {
+			return true
+		}
+	}
+	switch response := response.(type) {
+	case *corev1.Namespace:
+		return len(response.Spec.Finalizers) > 0
+	case *unstructured.Unstructured:
+		if response.GroupVersionKind().GroupKind() == (schema.GroupKind{Kind: "Namespace"}) {
+			specFinalizers, _, _ := unstructured.NestedStringSlice(response.Object, "spec", "finalizers")
+			return len(specFinalizers) > 0
+		}
+	}
+	return false
 }
 
 // DeleteAllOf implements client.Client.

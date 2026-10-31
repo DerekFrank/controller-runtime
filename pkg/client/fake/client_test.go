@@ -1213,13 +1213,9 @@ var _ = Describe("Fake client", func() {
 			Expect(err).ToNot(HaveOccurred())
 
 			By("Removing the finalizer")
-			obj := &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:       namespacedName.Name,
-					Namespace:  namespacedName.Namespace,
-					Finalizers: []string{},
-				},
-			}
+			Expect(newObj.DeletionTimestamp).NotTo(BeNil())
+			obj := newObj.DeepCopy()
+			obj.Finalizers = []string{}
 			err = cl.Patch(ctx, obj, client.MergeFrom(newObj))
 			Expect(err).ToNot(HaveOccurred())
 

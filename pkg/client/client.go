@@ -25,6 +25,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
@@ -323,7 +324,11 @@ func (c *client) Delete(ctx context.Context, obj Object, opts ...DeleteOption) e
 	case runtime.Unstructured:
 		return c.unstructuredClient.Delete(ctx, obj, opts...)
 	case *metav1.PartialObjectMetadata:
-		return c.metadataClient.Delete(ctx, obj, opts...)
+		u := &unstructured.Unstructured{}
+		u.SetGroupVersionKind(obj.GetObjectKind().GroupVersionKind())
+		u.SetNamespace(obj.GetNamespace())
+		u.SetName(obj.GetName())
+		return c.unstructuredClient.Delete(ctx, u, opts...)
 	default:
 		return c.typedClient.Delete(ctx, obj, opts...)
 	}
